@@ -3,7 +3,8 @@
 -- ERROR checks gate the pipeline (task stops / alert); WARN checks are reported only.
 -- Row-level rules already ran in 02_staging_load.sql (dq_errors/dq_warnings); these are batch/set-level.
 -- =====================================================================
-SET run_id = UUID_STRING();
+-- Snowflake's SET only accepts constant expressions (UUID_STRING() fails), so the orchestrator passes the run id.
+SET run_id = 'run_001';
 
 INSERT INTO OPS.DQ_RESULT (run_id, check_name, severity, failed_rows, total_rows, passed, detail)
 WITH t AS (SELECT COUNT(*) AS n FROM STG.MEMBER WHERE applied_at IS NULL OR applied_at >= DATEADD('day', -1, CURRENT_TIMESTAMP())),
