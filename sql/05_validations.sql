@@ -8,10 +8,12 @@ SET run_id = UUID_STRING();
 INSERT INTO OPS.DQ_RESULT (run_id, check_name, severity, failed_rows, total_rows, passed, detail)
 WITH t AS (SELECT COUNT(*) AS n FROM STG.MEMBER WHERE applied_at IS NULL OR applied_at >= DATEADD('day', -1, CURRENT_TIMESTAMP())),
 checks AS (
-    -- 1. Mandatory fields
-    SELECT 'mandatory_member_id' AS name, 'ERROR' AS sev, COUNT_IF(member_id IS NULL) AS failed, 'Member_Id is mandatory' AS detail FROM STG.MEMBER
-    UNION ALL SELECT 'mandatory_member_name', 'ERROR', COUNT_IF(member_name IS NULL), 'Member_Name is mandatory' FROM STG.MEMBER
-    UNION ALL SELECT 'mandatory_enrollment_date', 'ERROR', COUNT_IF(enrollment_date IS NULL), 'Enrollment_Date mandatory and must parse' FROM STG.MEMBER
+    -- 1. Mandatory fields: no VALID row may lack one (bad rows are quarantined and reported separately)
+    SELECT 'mandatory_fields_in_valid_rows' AS name, 'ERROR' AS sev,
+           COUNT_IF(is_valid AND (member_id IS NULL OR member_name IS NULL OR enrollment_date IS NULL)) AS failed,
+           'member_id, member_name, enrollment_date must be present on every valid row' AS detail FROM STG.MEMBER
+    UNION ALL SELECT 'quarantined_rows', 'WARN', COUNT_IF(NOT is_valid),
+           'rows that failed an ERROR rule (see STG.MEMBER_QUARANTINE)' FROM STG.MEMBER
     -- 2. Key uniqueness: (a) in the batch, (b) in each target, (c) across ALL country tables
     UNION ALL SELECT 'batch_duplicate_keys', 'WARN', COUNT(*), 'member_id repeated in staging; latest wins resolves it'
         FROM (SELECT member_id FROM STG.MEMBER WHERE is_valid AND applied_at IS NULL GROUP BY 1 HAVING COUNT(*) > 1)
