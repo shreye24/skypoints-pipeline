@@ -16,7 +16,9 @@ LANGUAGE SQL
 AS
 $$
 DECLARE
-    countries CURSOR FOR SELECT DISTINCT country_code FROM CORE.BATCH_LATEST;
+    -- one cursor per loop: re-using a single cursor for two FOR loops is fragile
+    countries_ddl   CURSOR FOR SELECT DISTINCT country_code FROM CORE.BATCH_LATEST;
+    countries_merge CURSOR FOR SELECT DISTINCT country_code FROM CORE.BATCH_APPLY;
     old_countries CURSOR FOR
         SELECT DISTINCT r.country_code AS old_cc
         FROM CORE.BATCH_APPLY b JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id
@@ -38,7 +40,7 @@ BEGIN
     n_rows := (SELECT COUNT(*) FROM CORE.BATCH_LATEST);
 
     -- 2. Make sure every country in the batch has a table (new country = no code change).
-    FOR rec IN countries DO
+    FOR rec IN countries_ddl DO
         cc  := rec.country_code;
         tbl := COALESCE((SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = :cc), 'TABLE_' || :cc);
         EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS CORE.' || tbl || ' LIKE CORE.MEMBER_TEMPLATE';
@@ -72,7 +74,7 @@ BEGIN
     END FOR;
 
     -- 4b. Upsert into each destination country table.
-    FOR rec IN countries DO
+    FOR rec IN countries_merge DO
         cc  := rec.country_code;
         tbl := (SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = :cc);
         EXECUTE IMMEDIATE
