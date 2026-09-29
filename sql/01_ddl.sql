@@ -99,6 +99,9 @@ CLUSTER BY (feed_date);
 -- FILE_FORMAT = (FORMAT_NAME = RAW.FF_MEMBER_PIPE) ON_ERROR = CONTINUE;
 -- Files should be split to ~100-250 MB compressed so the warehouse loads them in parallel.
 
+-- Append-only stream = exactly-once incremental processing of new landed rows.
+CREATE STREAM IF NOT EXISTS RAW.MEMBER_FEED_STREAM ON TABLE RAW.MEMBER_FEED APPEND_ONLY = TRUE;
+
 CREATE FILE FORMAT IF NOT EXISTS RAW.FF_REDEMPTION_NDJSON TYPE = JSON;
 
 -- One JSON document (one member) per line = NDJSON. Do NOT ship a single giant
@@ -116,7 +119,7 @@ CLUSTER BY (TO_DATE(doc:feed_date::STRING, 'YYYYMMDD'));
 -- dq_errors array is what routes a row to quarantine (no row is dropped).
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS STG.MEMBER (
-    member_id         VARCHAR(18)  NOT NULL,   -- treated as the business key (see README)
+    member_id         VARCHAR(18),             -- nullable here on purpose: NULL-key rows are quarantined, not dropped
     member_name       VARCHAR(255),
     enrollment_date   DATE,
     last_flight_date  DATE,
@@ -140,7 +143,8 @@ CREATE TABLE IF NOT EXISTS STG.MEMBER (
     dq_errors         ARRAY,                   -- rules that quarantine the row
     dq_warnings       ARRAY,                   -- rules that load the row but are reported
     is_valid          BOOLEAN      NOT NULL,
-    loaded_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+    loaded_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    applied_at        TIMESTAMP_NTZ            -- set once the row has been through the country split
 )
 CLUSTER BY (feed_date, country_code);
 

@@ -5,10 +5,12 @@
 -- Parameter: run_date (as-of date for Age / Stale_Member). Bind per run.
 -- =====================================================================
 SET run_date  = CURRENT_DATE();
-SET batch_lo  = (SELECT COALESCE(MAX(feed_date), '1900-01-01'::DATE) FROM STG.MEMBER);  -- incremental watermark
--- (Replace with a Snowflake STREAM on RAW.MEMBER_FEED for exactly-once incremental processing.)
+-- Incremental: read from the append-only stream on RAW.MEMBER_FEED (see 01_ddl.sql). Consuming the stream in
+-- this INSERT advances its offset in the same transaction, so a failed run reprocesses and a good run never repeats.
 
-INSERT INTO STG.MEMBER
+INSERT INTO STG.MEMBER (member_id, member_name, enrollment_date, last_flight_date, tier_code, agent_name, state,
+    country_code, country_raw, post_code, dob, is_active, member_type, age, stale_member, source_file,
+    source_file_row, feed_date, run_date, dq_errors, dq_warnings, is_valid, loaded_at)
 WITH src AS (
     SELECT
         NULLIF(TRIM(r.member_id), '')                              AS member_id,
@@ -25,9 +27,8 @@ WITH src AS (
         NULLIF(TRIM(r.post_code), '')                              AS post_code,
         UPPER(NULLIF(TRIM(r.is_active), ''))                       AS is_active,
         r.source_file, r.source_file_row, r.feed_date
-    FROM RAW.MEMBER_FEED r
+    FROM RAW.MEMBER_FEED_STREAM r
     WHERE r.rec_type = 'D'
-      AND r.feed_date > $batch_lo
 ),
 enriched AS (
     SELECT s.*,
@@ -79,10 +80,7 @@ SELECT
     dq_errors, dq_warnings,
     ARRAY_SIZE(dq_errors) = 0 AS is_valid,
     CURRENT_TIMESTAMP()
-FROM checked
-WHERE member_id IS NOT NULL OR TRUE;   -- keep rows with NULL keys too: they land as invalid, not dropped
--- NB: STG.MEMBER.member_id is NOT NULL in the DDL for the typed layer; if you prefer NULL-key rows to be
--- retained in staging, relax that constraint (recommended) or route them to a reject table.
+FROM checked;   -- no WHERE: every raw row is kept; bad ones land with is_valid = FALSE
 
 -- Batch-level warnings (need the whole file, so done as a second pass) -----------------------------
 -- 1. Member-id length outliers vs the file's dominant length (sample: 6,6,6,5,4)

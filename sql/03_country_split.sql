@@ -17,8 +17,12 @@ AS
 $$
 DECLARE
     countries CURSOR FOR SELECT DISTINCT country_code FROM CORE.BATCH_LATEST;
+    old_countries CURSOR FOR
+        SELECT DISTINCT r.country_code AS old_cc
+        FROM CORE.BATCH_APPLY b JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id
+        WHERE r.country_code <> b.country_code;
     tbl VARCHAR;
-    stmt VARCHAR;
+    cc  VARCHAR;
     view_sql VARCHAR DEFAULT '';
     n_moved NUMBER DEFAULT 0;
     n_rows NUMBER DEFAULT 0;
@@ -35,42 +39,45 @@ BEGIN
 
     -- 2. Make sure every country in the batch has a table (new country = no code change).
     FOR rec IN countries DO
-        tbl := COALESCE((SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = rec.country_code),
-                        'TABLE_' || rec.country_code);
+        cc  := rec.country_code;
+        tbl := COALESCE((SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = :cc), 'TABLE_' || :cc);
         EXECUTE IMMEDIATE 'CREATE TABLE IF NOT EXISTS CORE.' || tbl || ' LIKE CORE.MEMBER_TEMPLATE';
         INSERT INTO OPS.REF_COUNTRY (country_code, country_name, target_table)
-            SELECT rec.country_code, rec.country_code, :tbl
-            WHERE NOT EXISTS (SELECT 1 FROM OPS.REF_COUNTRY WHERE country_code = rec.country_code);
+            SELECT :cc, :cc, :tbl
+            WHERE NOT EXISTS (SELECT 1 FROM OPS.REF_COUNTRY WHERE country_code = :cc);
     END FOR;
 
-    -- 3. Apply atomically.
-    BEGIN TRANSACTION;
-
-    -- 3a. Rows that lost to a newer copy already stored are ignored (late-arriving old file).
-    CREATE OR REPLACE TEMPORARY TABLE CORE.BATCH_APPLY AS
+    -- 3. Work out what to apply. (DDL such as CREATE TABLE auto-commits in Snowflake, so all DDL is done
+    --    before the transaction starts.)
+    -- Rows that lost to a newer copy already stored are ignored (late-arriving old file).
+    CREATE OR REPLACE TRANSIENT TABLE CORE.BATCH_APPLY AS
         SELECT b.* FROM CORE.BATCH_LATEST b
         LEFT JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id
         WHERE r.member_id IS NULL OR b.feed_date >= r.feed_date;
+    n_moved := (SELECT COUNT(*) FROM CORE.BATCH_APPLY b JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id
+                WHERE r.country_code <> b.country_code);
 
-    -- 3b. Country moves: remove from the OLD country table (found via routing, one table per move).
-    FOR old IN (SELECT DISTINCT r.country_code AS old_cc
-                FROM CORE.BATCH_APPLY b JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id
-                WHERE r.country_code <> b.country_code) DO
-        tbl := (SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = old.old_cc);
+    -- 4. Apply atomically: a member is never in zero or two country tables.
+    BEGIN TRANSACTION;
+
+    -- 4a. Country moves: remove from the OLD country table (found via routing, one table per move).
+    FOR old IN old_countries DO
+        cc  := old.old_cc;
+        tbl := (SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = :cc);
         EXECUTE IMMEDIATE
             'DELETE FROM CORE.' || tbl || ' t USING (' ||
             '  SELECT b.member_id FROM CORE.BATCH_APPLY b JOIN CORE.MEMBER_ROUTING r ON r.member_id = b.member_id ' ||
-            '  WHERE r.country_code = ''' || old.old_cc || ''' AND b.country_code <> r.country_code) m ' ||
+            '  WHERE r.country_code = ''' || cc || ''' AND b.country_code <> r.country_code) m ' ||
             'WHERE t.member_id = m.member_id';
-        n_moved := n_moved + SQLROWCOUNT;
     END FOR;
 
-    -- 3c. Upsert into each destination country table.
+    -- 4b. Upsert into each destination country table.
     FOR rec IN countries DO
-        tbl := (SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = rec.country_code);
+        cc  := rec.country_code;
+        tbl := (SELECT target_table FROM OPS.REF_COUNTRY WHERE country_code = :cc);
         EXECUTE IMMEDIATE
             'MERGE INTO CORE.' || tbl || ' t USING ' ||
-            '(SELECT * FROM CORE.BATCH_APPLY WHERE country_code = ''' || rec.country_code || ''') s ' ||
+            '(SELECT * FROM CORE.BATCH_APPLY WHERE country_code = ''' || cc || ''') s ' ||
             'ON t.member_id = s.member_id ' ||
             'WHEN MATCHED AND s.feed_date >= t.feed_date THEN UPDATE SET ' ||
             '  member_name=s.member_name, enrollment_date=s.enrollment_date, last_flight_date=s.last_flight_date, ' ||
@@ -83,17 +90,17 @@ BEGIN
             '  s.country_code, s.post_code, s.dob, s.is_active, s.member_type, s.age, s.stale_member, s.feed_date, s.source_file)';
     END FOR;
 
-    -- 3d. Routing table follows the member.
+    -- 4c. Routing table follows the member.
     MERGE INTO CORE.MEMBER_ROUTING r USING CORE.BATCH_APPLY b ON r.member_id = b.member_id
     WHEN MATCHED THEN UPDATE SET country_code = b.country_code, feed_date = b.feed_date
     WHEN NOT MATCHED THEN INSERT (member_id, country_code, feed_date) VALUES (b.member_id, b.country_code, b.feed_date);
 
-    -- 3e. Mark staging rows as applied (superseded duplicates included) so the next run is incremental.
+    -- 4d. Mark staging rows as applied (superseded duplicates included) so the next run is incremental.
     UPDATE STG.MEMBER SET applied_at = CURRENT_TIMESTAMP() WHERE is_valid AND applied_at IS NULL;
 
     COMMIT;
 
-    -- 4. Rebuild the unified view so new countries show up.
+    -- 5. Rebuild the unified view (DDL, so after COMMIT) so new countries show up.
     SELECT LISTAGG('SELECT * FROM CORE.' || target_table, ' UNION ALL ') INTO :view_sql FROM OPS.REF_COUNTRY;
     EXECUTE IMMEDIATE 'CREATE OR REPLACE VIEW CORE.V_MEMBER_ALL AS ' || view_sql;
 
@@ -101,16 +108,13 @@ BEGIN
 END;
 $$;
 
-ALTER TABLE STG.MEMBER ADD COLUMN IF NOT EXISTS applied_at TIMESTAMP_NTZ;
-
 -- CALL CORE.SP_SPLIT_BY_COUNTRY();
 -- Schedule with a TASK after the staging load, or trigger from a STREAM: 
---   CREATE TASK ... WHEN SYSTEM$STREAM_HAS_DATA('STG.MEMBER_STREAM') AS CALL CORE.SP_SPLIT_BY_COUNTRY();
+--   CREATE TASK ... AFTER <staging-load task> AS CALL CORE.SP_SPLIT_BY_COUNTRY();
 
 -- ---------------------------------------------------------------------
 -- The same split as plain SQL for the 3 known countries (readable version of what the proc generates):
--- INSERT OVERWRITE-free approach: one MERGE per country as above. A single-statement alternative for
--- *initial loads* (empty targets) is a multi-table insert:
+-- One MERGE per country as above. A single-statement alternative for *initial loads* (empty targets) is a multi-table insert:
 --
 -- INSERT ALL
 --   WHEN country_code = 'IND' THEN INTO CORE.TABLE_INDIA     (member_id, member_name, ...) VALUES (member_id, member_name, ...)

@@ -35,11 +35,11 @@ checks AS (
     -- Source-vs-staging reconciliation: catches a load that silently drops columns (sample staging lost Agent_Name)
     UNION ALL SELECT 'recon_row_count', 'ERROR',
         ABS((SELECT COUNT(*) FROM RAW.MEMBER_FEED WHERE rec_type = 'D') - (SELECT COUNT(*) FROM STG.MEMBER)),
-        'RAW detail rows must equal STG rows (nothing dropped)' FROM DUAL_T
+        'RAW detail rows must equal STG rows (nothing dropped)' FROM (SELECT 1 AS x)
     UNION ALL SELECT 'recon_agent_name', 'ERROR',
         GREATEST((SELECT COUNT_IF(NULLIF(TRIM(agent_name),'') IS NOT NULL) FROM RAW.MEMBER_FEED WHERE rec_type='D')
                - (SELECT COUNT_IF(agent_name IS NOT NULL) FROM STG.MEMBER), 0),
-        'agent_name non-null count dropped between RAW and STG' FROM DUAL_T
+        'agent_name non-null count dropped between RAW and STG' FROM (SELECT 1 AS x)
     -- Redemptions
     UNION ALL SELECT 'redemption_unique_txn', 'ERROR', COUNT(*), 'txn_id duplicated in CORE.REDEMPTION'
         FROM (SELECT txn_id FROM CORE.REDEMPTION GROUP BY 1 HAVING COUNT(*) > 1)
@@ -47,9 +47,6 @@ checks AS (
     UNION ALL SELECT 'redemption_rejects', 'WARN', COUNT(*), 'rows in STG.REDEMPTION_REJECT' FROM STG.REDEMPTION_REJECT
 )
 SELECT $run_id, name, sev, failed, (SELECT n FROM t), failed = 0, detail FROM checks;
-
--- DUAL_T: single-row helper so scalar sub-selects can sit in a UNION ALL
--- CREATE VIEW OPS.DUAL_T AS SELECT 1 AS x;   (referenced above as DUAL_T; create it in OPS)
 
 -- Gate: fail the task if any ERROR check failed
 -- SELECT IFF(COUNT_IF(severity='ERROR' AND NOT passed) > 0,
