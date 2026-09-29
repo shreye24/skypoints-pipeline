@@ -64,8 +64,27 @@ Redemption feed
 - Flat-file `DOB` format is not specified; I assumed `DDMMYYYY` (`03051985` is ambiguous: 3 May vs 5 March). Configurable in `config.FLAT_DATE_HINTS`.
 - Flat-file `feed_date` comes from the file name (`YYYYMMDD`).
 
+## Verification status
+
+Verified
+- **Python:** 37 pytest tests pass (also confirmed on Windows, Python 3.14, pandas 3), and the CLI reproduces the expected results on the sample files.
+- **Snowflake (trial account, run end-to-end on the sample data):** DDL (`01`), staging load (`02`), country split incl. a USA -> CAN move and latest-wins (`03`), redemption flatten/upsert/join (`04`) and validations (`05`). Staging output matched the Python output row for row; the final country tables, routing table and DQ results matched expectations.
+
+Bugs found by running it on Snowflake (and fixed)
+- New SQL files have no database selected -> every script starts with `USE DATABASE` / `USE WAREHOUSE`.
+- `03`: re-using one cursor for two `FOR` loops meant the country-table `MERGE` silently ran zero times while the routing table updated. Now one cursor per loop.
+- `05`: `SET run_id = UUID_STRING()` is rejected (SET needs a constant), so the run id is passed in. The mandatory-field check also counted quarantined rows as pipeline failures; it now checks valid rows only, with quarantined rows reported as a WARN.
+
+Not verified on Snowflake
+- `COPY INTO` from a stage and Snowpipe/streams/tasks: the sample rows were loaded with `sql/00_sample_data_inserts.sql` instead. The `COPY` statements in `01_ddl.sql` are untested.
+- Performance at billions of rows (reasoned, not benchmarked).
+- The Excel country extracts are handled by the Python readers only; there is no Snowflake load path for them yet.
+
+Run order on Snowflake: `01_ddl` -> `00_sample_data_inserts` (or COPY) -> `02_staging_load` (set `run_date`) -> `03_country_split`, then `CALL CORE.SP_SPLIT_BY_COUNTRY()` -> `04_redemptions` -> `05_validations`. To see a country move, mark the 16 Jan staging rows applied first, call the procedure, then unmark them and call it again.
+
 ## Known limitations
-- The SQL was written for Snowflake but **I could not execute it here** (no Snowflake account). The Python mirror is tested; the SQL should be run against a dev account and the Snowflake-scripting procedure in particular reviewed before production use.
-- `02_staging_load.sql` stamps `applied_at` on all pending valid rows at the end of the split; rows landing mid-run should be excluded with a batch-id in production.
-- The Python runner is in-memory pandas (demo scale). Production path for billions of rows is the SQL, not Python.
-- Stale/age columns on country tables are point-in-time; a daily refresh (or a view) is needed to keep them current between feeds.
+- **Short rows are not caught in the Snowflake path.** A detail row with too few fields (e.g. `|D|Liam|223462|...|USA`) lands with NULLs and is staged as valid, while the Python reader rejects it as `BAD_FIELD_COUNT`. Proposed fix: land each line whole (`raw_line`) and `SPLIT` it in staging, so the field count can be checked. Not implemented.
+- Row-level warnings `SUSPECT_CONSTANT_COLUMN` and `DUPLICATE_KEY_IN_FILE` exist in Python only; on Snowflake they are covered by set-level checks in `05_validations.sql` (and only for DOB).
+- `02_staging_load.sql` stamps `applied_at` on all pending valid rows at the end of the split; rows landing mid-run should be excluded with a batch id in production.
+- The Python runner is in-memory pandas (demo scale); the production path for billions of rows is the SQL.
+- Age/stale columns on country tables are point-in-time; refresh daily or expose them through a view.
