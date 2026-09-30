@@ -1,7 +1,7 @@
 # SkyPoints member & redemption pipeline
 
 Snowflake-first design (SQL in `sql/`) with a Python reference implementation (`src/skypoints/`) that mirrors the
-SQL logic, runs locally on the sample files, and is covered by 37 pytest tests (`python -m pytest`).
+SQL logic, runs locally on the sample files, and is covered by 39 pytest tests (`python -m pytest`).
 
 | Deliverable | Where |
 |---|---|
@@ -12,6 +12,15 @@ SQL logic, runs locally on the sample files, and is covered by 37 pytest tests (
 | 5. Validations | `sql/05_validations.sql` · `staging.py` · `tests/` |
 
 Run locally: `PYTHONPATH=src python -m skypoints.cli --members data/sample/members_2024011*.txt --xlsx AUS=data/sample/AUS.xlsx USA=data/sample/USA.xlsx IND=data/sample/IND.xlsx --redemptions data/sample/redemptions_2024011*.ndjson --as-of 2024-01-16`
+
+## How AI was used
+
+This solution was built with Claude (Anthropic) as an AI pair-programmer, as the brief requires. Claude drafted the design, SQL, Python and tests. What was done by me, not the AI:
+- ran the test suite locally on Windows and ran every Snowflake script step by step on a Snowflake trial account, comparing each result with a hand-computed expectation;
+- those runs caught real defects in the AI's first draft, which were then fixed and re-run (see "Bugs found by running it"): missing database context, a cursor reused across two loops so the country tables silently stayed empty, a `SET` with a non-constant expression, and a validation that reported quarantined rows as pipeline failures;
+- reviewed the assumptions (DOB format, US integer dates, ID prefixes, key column) and decided which to keep.
+
+Correctness comes from the tests and the Snowflake runs, not from trusting generated code.
 
 ## Architecture
 
@@ -66,25 +75,30 @@ Redemption feed
 
 ## Verification status
 
-Verified
-- **Python:** 37 pytest tests pass (also confirmed on Windows, Python 3.14, pandas 3), and the CLI reproduces the expected results on the sample files.
-- **Snowflake (trial account, run end-to-end on the sample data):** DDL (`01`), staging load (`02`), country split incl. a USA -> CAN move and latest-wins (`03`), redemption flatten/upsert/join (`04`) and validations (`05`). Staging output matched the Python output row for row; the final country tables, routing table and DQ results matched expectations.
+Verified by running it
+- **Python:** 39 pytest tests pass (also on Windows, Python 3.14, pandas 3), and the CLI reproduces the expected results on the sample files.
+- **Snowflake (trial account), rebuilt from an empty database and run end to end:**
+  - `01_ddl` from scratch; sample files uploaded to stages and loaded with the real `COPY INTO` (`01a`, including a second run that loaded only the new files); header-driven split (`01b`); staging with Age / Stale_Member (`02`).
+  - Country split (`03`) across two incremental runs using streams: day 1 loaded 5 members into 5 country tables, day 2 moved Elena USA -> CAN and applied Ravi's newer record (`batch rows=2, country moves=1`); no member in more than one table; routing table agrees with the tables.
+  - Redemptions (`04`): nested JSON flattened, `RX10092` updated PENDING -> COMPLETED by the later feed, `RX10093` (-50 miles) rejected, both valid transactions join to Elena in CAN after her move.
+  - Validations (`05`): 20 checks; all 8 ERROR checks pass; the WARN checks report exactly the data problems listed above.
+  - Short rows: `|D|Liam|223462|...|USA` (8 of 10 fields) is now quarantined as `BAD_FIELD_COUNT:8vs10` on Snowflake, matching the Python reader.
+  - Excel extracts, converted to flat files and loaded through the same stage -> COPY -> split path: 8 of 9 rows loaded into AUS/USA/IND; `AUS-2` (invalid date) quarantined; country totals AUS 3, CAN 2, IND 4, PHL 1, USA 3.
 
-Bugs found by running it on Snowflake (and fixed)
-- New SQL files have no database selected -> every script starts with `USE DATABASE` / `USE WAREHOUSE`.
+Bugs found by running it (all fixed)
+- New SQL worksheets have no database selected -> every script starts with `USE DATABASE` / `USE WAREHOUSE`.
 - `03`: re-using one cursor for two `FOR` loops meant the country-table `MERGE` silently ran zero times while the routing table updated. Now one cursor per loop.
 - `05`: `SET run_id = UUID_STRING()` is rejected (SET needs a constant), so the run id is passed in. The mandatory-field check also counted quarantined rows as pipeline failures; it now checks valid rows only, with quarantined rows reported as a WARN.
+- Short rows were staged as valid on Snowflake (COPY padded them with NULLs) -> files now land line by line and are split using each file's own header, recording declared vs actual field count.
 
-Not verified on Snowflake
-- `COPY INTO` from a stage and Snowpipe/streams/tasks: the sample rows were loaded with `sql/00_sample_data_inserts.sql` instead. The `COPY` statements in `01_ddl.sql` are untested.
-- Performance at billions of rows (reasoned, not benchmarked).
-- The Excel country extracts are handled by the Python readers only; there is no Snowflake load path for them yet.
+Run order on Snowflake: `01_ddl` -> upload files to the stages -> `01a_load_files` (COPY) -> `01b_split_lines` -> `02_staging_load` (set `run_date`, `batch_id`) -> `03_country_split` (creates the procedure), then `CALL CORE.SP_SPLIT_BY_COUNTRY()` -> `04_redemptions` -> `05_validations`. `00_fallback_inserts.sql` replaces the upload + `01a` if a stage cannot be used. Load day 1, run the pipeline, then load day 2 and run it again to see a country move.
 
-Run order on Snowflake: `01_ddl` -> `00_sample_data_inserts` (or COPY) -> `02_staging_load` (set `run_date`) -> `03_country_split`, then `CALL CORE.SP_SPLIT_BY_COUNTRY()` -> `04_redemptions` -> `05_validations`. To see a country move, mark the 16 Jan staging rows applied first, call the procedure, then unmark them and call it again.
+Excel country extracts are converted to the same flat-file format (`python -m skypoints.convert AUS=data/sample/AUS.xlsx ... --feed-date 2024-01-16 --out data/sample/converted`) and loaded through the identical path, so Snowflake needs one loader for every source.
 
-## Known limitations
-- **Short rows are not caught in the Snowflake path.** A detail row with too few fields (e.g. `|D|Liam|223462|...|USA`) lands with NULLs and is staged as valid, while the Python reader rejects it as `BAD_FIELD_COUNT`. Proposed fix: land each line whole (`raw_line`) and `SPLIT` it in staging, so the field count can be checked. Not implemented.
-- Row-level warnings `SUSPECT_CONSTANT_COLUMN` and `DUPLICATE_KEY_IN_FILE` exist in Python only; on Snowflake they are covered by set-level checks in `05_validations.sql` (and only for DOB).
-- `02_staging_load.sql` stamps `applied_at` on all pending valid rows at the end of the split; rows landing mid-run should be excluded with a batch id in production.
-- The Python runner is in-memory pandas (demo scale); the production path for billions of rows is the SQL.
-- Age/stale columns on country tables are point-in-time; refresh daily or expose them through a view.
+## Not verified / known limitations
+- **Scale.** `sql/06_scale_test.sql` generates millions of rows to smoke-test the set-based path, but **it has not been run**. Nothing has been benchmarked, and nothing has been tested at billions of rows; the design (set-based SQL, streams, routing table, MERGE, clustering) is reasoned for that scale, not measured.
+- **Orchestration is manual.** Snowpipe auto-ingest and scheduled tasks are not built. `run_date`, `batch_id` and the validation `run_id` are constants that an orchestrator would pass in.
+- **Redemption increments.** `04_redemptions.sql` picks up new rows with `loaded_at > max(updated_at)` of the target, a simplification. Production should use a stream on `RAW.REDEMPTION_FEED` like the member path.
+- **Python vs SQL differences in behaviour (same outcome).** The Python reader rejects malformed lines before staging; the SQL path keeps them in `STG.MEMBER` flagged `is_valid = FALSE`. The Python runner is in-memory pandas (demo scale); the production path is the SQL.
+- Age / stale columns on country tables are point-in-time; refresh daily or expose them through a view.
+- The assumptions above (key column, DOB format, US integer dates, country-prefixed IDs for the Excel extracts) are unconfirmed with the business.
