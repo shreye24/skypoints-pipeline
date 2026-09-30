@@ -218,3 +218,34 @@ def test_malformed_json_line_is_rejected_not_fatal(tmp_path):
     p.write_text('{"member_id":"1","feed_date":"20240101","redemptions":[]}\n{oops\n')
     good, bad = redemptions.flatten(str(p))
     assert len(good) == 0 and bad.reason.iloc[0].startswith("INVALID_JSON")
+
+
+# ---------- xlsx -> flat converter (one loader for every source) ----------
+def test_converter_roundtrip_matches_direct_xlsx_path(tmp_path):
+    from skypoints import convert
+    direct_frames, flat_frames = [], []
+    for cc in ("AUS", "USA", "IND"):
+        direct_frames.append(readers.read_country_xlsx(f"{S}{cc}.xlsx", cc, AS_OF)[0])
+        out = convert.xlsx_to_flat(f"{S}{cc}.xlsx", cc, AS_OF, str(tmp_path))
+        df, rej = readers.read_flat_file(out)
+        assert rej == []
+        flat_frames.append(df)
+    cols = ["member_id", "member_name", "enrollment_date", "last_flight_date", "dob", "country_code",
+            "member_type", "is_valid"]
+    a = staging.stage(pd.concat(direct_frames, ignore_index=True), AS_OF)[cols].sort_values("member_id").reset_index(drop=True)
+    b = staging.stage(pd.concat(flat_frames, ignore_index=True), AS_OF)[cols].sort_values("member_id").reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+    assert list(b[~b.is_valid].member_id) == ["AUS-2"]           # bad date passed through, then quarantined
+    assert b.set_index("member_id").loc["IND-2", "member_type"] == "C"
+
+
+# ---------- validation rule parity with the SQL ----------
+def test_constant_column_rule_is_80_percent_of_non_null_values():
+    base, _ = raw_flat("members_20240115.txt")
+    base = pd.concat([base] * 2, ignore_index=True)               # 10 rows, DOB all identical
+    assert any("SUSPECT_CONSTANT_COLUMN:dob" in w for w in staging.stage(base, AS_OF).dq_warnings.iloc[0])
+    base.loc[:2, "dob"] = ["01011970", "02021971", "03031972"]    # 7/10 = 70% -> below the threshold
+    assert not any("SUSPECT_CONSTANT_COLUMN:dob" in w for w in staging.stage(base, AS_OF).dq_warnings.iloc[5])
+    base.loc[:0, "dob"] = ["01011970"]                            # 9/10 identical again -> flagged
+    base.loc[1:2, "dob"] = "03051985"
+    assert any("SUSPECT_CONSTANT_COLUMN:dob" in w for w in staging.stage(base, AS_OF).dq_warnings.iloc[5])

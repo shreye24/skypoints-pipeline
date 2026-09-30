@@ -118,13 +118,12 @@ def _batch_checks(df: pd.DataFrame) -> pd.DataFrame:
             if cnt / len(lens) >= 0.5:
                 for i in sub.index[sub["member_id"].notna() & (sub["member_id"].map(lambda x: len(x) if x else mode) != mode)]:
                     df.at[i, "dq_warnings"] = df.at[i, "dq_warnings"] + [f"MEMBER_ID_LENGTH_OUTLIER:{len(df.at[i,'member_id'])}vs{mode}"]
-        # identical values everywhere = placeholder / defaulted column
-        if len(sub) >= 3:
-            for c in ("dob", "enrollment_date", "last_flight_date"):
-                vals = sub[c].dropna()
-                if len(vals) >= 3 and vals.nunique() == 1:
-                    for i in sub.index:
-                        df.at[i, "dq_warnings"] = df.at[i, "dq_warnings"] + [f"SUSPECT_CONSTANT_COLUMN:{c}"]
+        # one value covering >=80% of a file's non-null values = placeholder / defaulted column
+        for c in ("dob", "enrollment_date", "last_flight_date"):
+            vals = sub[c].dropna()
+            if len(vals) >= 3 and Counter(vals).most_common(1)[0][1] / len(vals) >= 0.8:
+                for i in sub.index:
+                    df.at[i, "dq_warnings"] = df.at[i, "dq_warnings"] + [f"SUSPECT_CONSTANT_COLUMN:{c}"]
         # duplicate key inside one file (resolved later by latest-wins, but reported)
         dup = sub[sub["member_id"].notna() & sub.duplicated("member_id", keep=False)]
         for i in dup.index:

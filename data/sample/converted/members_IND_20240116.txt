@@ -1,0 +1,4 @@
+|H|Member_Name|Member_Id|Enrollment_Date|Last_Flight_Date|Tier_Code|Agent_Name|State|Country|DOB|Is_Active|Member_Type
+|D|Vikas|IND-1|20220101|20220615|SLV|||IND|01121998||I
+|D|Rahul|IND-2|20220305|20220310|GLD|||IND|13081982||C
+|D|Sameer|IND-3|20220220|20220225|GLD|||IND|13081952||I

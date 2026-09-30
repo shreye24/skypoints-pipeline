@@ -1,0 +1,4 @@
+|H|Member_Name|Member_Id|Enrollment_Date|Last_Flight_Date|Tier_Code|Agent_Name|State|Country|DOB|Is_Active|Member_Type
+|D|Sam|USA-1|20220615|20220820|PLT|||USA|||
+|D|John|USA-2|20220105|20220115|SLV|||USA|||
+|D|Mike|USA-3|20211228|20211230|GLD|||USA|||

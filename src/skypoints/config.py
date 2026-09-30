@@ -25,7 +25,7 @@ FLAT_HEADER_MAP = {
     "member_name": "member_name", "member_id": "member_id",
     "enrollment_date": "enrollment_date", "last_flight_date": "last_flight_date",
     "tier_code": "tier_code", "agent_name": "agent_name", "state": "state",
-    "country": "country", "post_code": "post_code", "dob": "dob", "is_active": "is_active",
+    "country": "country", "post_code": "post_code", "dob": "dob", "is_active": "is_active", "member_type": "member_type",
 }
 
 # Date-format hints per canonical column, per source. Compact numeric dates only
