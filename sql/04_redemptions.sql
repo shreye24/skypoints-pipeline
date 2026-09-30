@@ -1,3 +1,6 @@
+USE DATABASE SKYPOINTS;
+USE WAREHOUSE COMPUTE_WH;
+
 -- =====================================================================
 -- Semi-structured redemption feed -> flattened, queryable table  (deliverable 4)
 -- Input shape: one JSON document per member per day (NDJSON), redemptions is an array.

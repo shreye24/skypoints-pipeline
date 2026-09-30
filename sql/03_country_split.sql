@@ -1,3 +1,6 @@
+USE DATABASE SKYPOINTS;
+USE WAREHOUSE COMPUTE_WH;
+
 -- =====================================================================
 -- STG.MEMBER -> CORE.TABLE_<COUNTRY>   (deliverable 3)
 -- "Latest record wins", including members who moved countries.
@@ -28,13 +31,17 @@ DECLARE
     view_sql VARCHAR DEFAULT '';
     n_moved NUMBER DEFAULT 0;
     n_rows NUMBER DEFAULT 0;
+    cutoff TIMESTAMP_NTZ;
 BEGIN
+    -- Only rows loaded before this instant are processed AND marked applied; rows landing mid-run wait for the next run.
+    cutoff := CURRENT_TIMESTAMP()::TIMESTAMP_NTZ;
+
     -- 1. Latest record per member for rows not yet applied. Newest feed wins; ties -> later file, later row.
     CREATE OR REPLACE TRANSIENT TABLE CORE.BATCH_LATEST AS
         SELECT member_id, member_name, enrollment_date, last_flight_date, tier_code, agent_name, state,
                country_code, post_code, dob, is_active, member_type, age, stale_member, feed_date, source_file
         FROM STG.MEMBER
-        WHERE is_valid AND applied_at IS NULL
+        WHERE is_valid AND applied_at IS NULL AND loaded_at <= :cutoff
         QUALIFY ROW_NUMBER() OVER (PARTITION BY member_id
                                    ORDER BY feed_date DESC, source_file DESC, source_file_row DESC) = 1;
     n_rows := (SELECT COUNT(*) FROM CORE.BATCH_LATEST);
@@ -98,7 +105,7 @@ BEGIN
     WHEN NOT MATCHED THEN INSERT (member_id, country_code, feed_date) VALUES (b.member_id, b.country_code, b.feed_date);
 
     -- 4d. Mark staging rows as applied (superseded duplicates included) so the next run is incremental.
-    UPDATE STG.MEMBER SET applied_at = CURRENT_TIMESTAMP() WHERE is_valid AND applied_at IS NULL;
+    UPDATE STG.MEMBER SET applied_at = CURRENT_TIMESTAMP() WHERE is_valid AND applied_at IS NULL AND loaded_at <= :cutoff;
 
     COMMIT;
 

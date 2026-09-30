@@ -1,3 +1,6 @@
+USE DATABASE SKYPOINTS;
+USE WAREHOUSE COMPUTE_WH;
+
 -- =====================================================================
 -- Data validations (deliverable 5). Each check writes a row to OPS.DQ_RESULT.
 -- ERROR checks gate the pipeline (task stops / alert); WARN checks are reported only.
@@ -32,13 +35,17 @@ checks AS (
     UNION ALL SELECT 'dob_after_enrollment', 'WARN', COUNT_IF(dob >= enrollment_date), 'member enrolled before being born' FROM STG.MEMBER
     UNION ALL SELECT 'age_out_of_range', 'WARN', COUNT_IF(age > 120 OR age < 0), 'implausible age' FROM STG.MEMBER
     -- Placeholder detection: a column where one value covers >= 80% of a file (sample: every DOB = 03051985)
-    UNION ALL SELECT 'suspect_constant_dob', 'WARN', COUNT(*), 'one DOB value covers >=80% of a file with >=3 rows'
-        FROM (SELECT source_file FROM STG.MEMBER WHERE dob IS NOT NULL GROUP BY source_file, dob
-              QUALIFY COUNT(*) >= 3 AND COUNT(*) / SUM(COUNT(*)) OVER (PARTITION BY source_file) >= 0.8)
+    UNION ALL SELECT 'suspect_constant_column_rows', 'WARN', COUNT_IF(ARRAY_TO_STRING(dq_warnings, ',') ILIKE '%SUSPECT_CONSTANT_COLUMN%'),
+        'rows in files where one DOB / enrollment / flight date covers >=80% of the values' FROM STG.MEMBER
+    UNION ALL SELECT 'field_count_errors', 'WARN', COUNT_IF(ARRAY_TO_STRING(dq_errors, ',') ILIKE '%FIELD_COUNT%' OR ARRAY_TO_STRING(dq_errors, ',') ILIKE '%MISSING_HEADER%'),
+        'lines with fewer/more fields than their file header declares (quarantined)' FROM STG.MEMBER
     -- Source-vs-staging reconciliation: catches a load that silently drops columns (sample staging lost Agent_Name)
     UNION ALL SELECT 'recon_row_count', 'ERROR',
         ABS((SELECT COUNT(*) FROM RAW.MEMBER_FEED WHERE rec_type = 'D') - (SELECT COUNT(*) FROM STG.MEMBER)),
         'RAW detail rows must equal STG rows (nothing dropped)' FROM (SELECT 1 AS x)
+    UNION ALL SELECT 'recon_line_to_feed', 'ERROR',
+        ABS((SELECT COUNT(*) FROM RAW.MEMBER_LINE WHERE SPLIT_PART(raw_line, '|', 2) = 'D') - (SELECT COUNT(*) FROM RAW.MEMBER_FEED)),
+        'every detail line landed must appear in RAW.MEMBER_FEED after the split' FROM (SELECT 1 AS x)
     UNION ALL SELECT 'recon_agent_name', 'ERROR',
         GREATEST((SELECT COUNT_IF(NULLIF(TRIM(agent_name),'') IS NOT NULL) FROM RAW.MEMBER_FEED WHERE rec_type='D')
                - (SELECT COUNT_IF(agent_name IS NOT NULL) FROM STG.MEMBER), 0),
