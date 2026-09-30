@@ -6,6 +6,7 @@
 --          OPS (reference data, DQ results)
 -- =====================================================================
 CREATE DATABASE IF NOT EXISTS SKYPOINTS;
+USE WAREHOUSE COMPUTE_WH;
 USE DATABASE SKYPOINTS;
 CREATE SCHEMA IF NOT EXISTS RAW;
 CREATE SCHEMA IF NOT EXISTS STG;
@@ -60,12 +61,26 @@ ON t.tier_code = s.tier_code WHEN NOT MATCHED THEN INSERT VALUES (s.tier_code);
 -- RAW: landing tables. Everything VARCHAR so a bad value can never fail
 -- the load; lineage columns let us replay/audit any row.
 -- ---------------------------------------------------------------------
-CREATE FILE FORMAT IF NOT EXISTS RAW.FF_MEMBER_PIPE
-    TYPE = CSV FIELD_DELIMITER = '|' SKIP_HEADER = 1
-    ERROR_ON_COLUMN_COUNT_MISMATCH = FALSE   -- short rows land as NULLs; caught by DQ
-    EMPTY_FIELD_AS_NULL = TRUE NULL_IF = ('', 'NULL')
-    TRIM_SPACE = TRUE ENCODING = 'UTF8';
+-- Member files land LINE BY LINE (one text column, no delimiter parsing at load time). Nothing can be
+-- rejected or silently padded by COPY; the split into columns - and the field-count check - happens in
+-- 01b_split_lines.sql, driven by each file's own H (header) record.
+CREATE FILE FORMAT IF NOT EXISTS RAW.FF_MEMBER_LINE
+    TYPE = CSV FIELD_DELIMITER = NONE SKIP_HEADER = 0
+    FIELD_OPTIONALLY_ENCLOSED_BY = NONE ESCAPE_UNENCLOSED_FIELD = NONE
+    ENCODING = 'UTF8';
 
+CREATE TABLE IF NOT EXISTS RAW.MEMBER_LINE (
+    raw_line          VARCHAR   NOT NULL,   -- e.g. |D|Elena|223457|20101012|...
+    source_file       VARCHAR   NOT NULL,
+    source_file_row   NUMBER    NOT NULL,   -- 1-based line number in the file
+    feed_date         DATE      NOT NULL,   -- business date of the feed (from file name)
+    loaded_at         TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP()
+)
+CLUSTER BY (feed_date);
+
+CREATE STREAM IF NOT EXISTS RAW.MEMBER_LINE_STREAM ON TABLE RAW.MEMBER_LINE APPEND_ONLY = TRUE;
+
+-- Split (typed-as-text) detail rows. Written by 01b_split_lines.sql.
 CREATE TABLE IF NOT EXISTS RAW.MEMBER_FEED (
     filler            VARCHAR,      -- text before the leading '|'
     rec_type          VARCHAR,      -- 'D' for detail rows
@@ -80,6 +95,9 @@ CREATE TABLE IF NOT EXISTS RAW.MEMBER_FEED (
     dob               VARCHAR,
     is_active         VARCHAR,
     post_code         VARCHAR,      -- in the design doc layout, absent from the sample feed
+    member_type       VARCHAR,      -- optional column (country extracts, e.g. Individual/Corporate)
+    field_count       NUMBER,       -- fields actually present on this line
+    expected_field_count NUMBER,    -- fields declared by the file's header record
     -- lineage
     source_file       VARCHAR   NOT NULL,
     source_file_row   NUMBER    NOT NULL,
@@ -88,21 +106,16 @@ CREATE TABLE IF NOT EXISTS RAW.MEMBER_FEED (
 )
 CLUSTER BY (feed_date);
 
--- Load pattern (run by Snowpipe auto-ingest or a scheduled task):
--- COPY INTO RAW.MEMBER_FEED (filler, rec_type, member_name, member_id, enrollment_date,
---        last_flight_date, tier_code, agent_name, state, country, dob, is_active, post_code,
---        source_file, source_file_row, feed_date)
--- FROM (SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
---              METADATA$FILENAME, METADATA$FILE_ROW_NUMBER,
---              TO_DATE(REGEXP_SUBSTR(METADATA$FILENAME,'[0-9]{8}'),'YYYYMMDD')
---       FROM @RAW.MEMBER_STAGE)
--- FILE_FORMAT = (FORMAT_NAME = RAW.FF_MEMBER_PIPE) ON_ERROR = CONTINUE;
+-- Loading: see 01a_load_files.sql (COPY line-by-line into RAW.MEMBER_LINE) and 01b_split_lines.sql.
 -- Files should be split to ~100-250 MB compressed so the warehouse loads them in parallel.
 
 -- Append-only stream = exactly-once incremental processing of new landed rows.
 CREATE STREAM IF NOT EXISTS RAW.MEMBER_FEED_STREAM ON TABLE RAW.MEMBER_FEED APPEND_ONLY = TRUE;
 
 CREATE FILE FORMAT IF NOT EXISTS RAW.FF_REDEMPTION_NDJSON TYPE = JSON;
+
+CREATE STAGE IF NOT EXISTS RAW.MEMBER_STAGE     FILE_FORMAT = RAW.FF_MEMBER_LINE;
+CREATE STAGE IF NOT EXISTS RAW.REDEMPTION_STAGE FILE_FORMAT = RAW.FF_REDEMPTION_NDJSON;
 
 -- One JSON document (one member) per line = NDJSON. Do NOT ship a single giant
 -- array: it forces STRIP_OUTER_ARRAY and a single-threaded parse at scale.
@@ -143,6 +156,7 @@ CREATE TABLE IF NOT EXISTS STG.MEMBER (
     dq_errors         ARRAY,                   -- rules that quarantine the row
     dq_warnings       ARRAY,                   -- rules that load the row but are reported
     is_valid          BOOLEAN      NOT NULL,
+    batch_id          VARCHAR,                 -- run that produced the row (passed in by the orchestrator)
     loaded_at         TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
     applied_at        TIMESTAMP_NTZ            -- set once the row has been through the country split
 )
